@@ -1,6 +1,8 @@
-using BalancerAuraDestinationVault as BalancerDestVault;
-using CurveConvexDestinationVault as CurveDestVault;
-using SystemRegistry as systemRegistry;
+using BalancerAuraDestinationVault as _BalancerDestVault;
+using CurveConvexDestinationVault as _CurveDestVault;
+using SystemRegistry as _SystemRegistry;
+using ERC20A as _ERC20A;
+using ERC20B as _ERC20B;
 
 /////////////////// METHODS ///////////////////////
 
@@ -10,6 +12,7 @@ methods {
     function getDestinationSummaryStatsExternal(address, uint256, LMPStrategy.RebalanceDirection, uint256) 
         external returns (IStrategy.SummaryStats);
     function getSwapCostOffsetTightenThresholdInViolations() external returns (uint16) envfree;
+    function getRebalanceValueStatsHarness(IStrategy.RebalanceParams params) external returns (LMPStrategy.RebalanceValueStats);
     // Immutable
     function lmpVault() external returns (address) envfree;
     function pauseRebalancePeriodInDays() external returns (uint16) envfree;
@@ -55,11 +58,6 @@ methods {
     function swapCostOffsetPeriodInDays() external returns (uint16);
     function paused() external returns (bool);
     
-    // Can help reduce complexity, think carefully about implications before using.
-    // May need to think of a more clever way to summarize this.
-    // function LMPStrategy.getRebalanceValueStats(IStrategy.RebalanceParams memory input) internal returns (LMPStrategy.RebalanceValueStats memory) 
-    //    => getRebalanceValueStatsCVL(input);
-
     // ILMPVault
     // Summarized instead of linked to help with runtime. 
     // The two state changing functions don't change any relevant state and aren't implemented.
@@ -67,31 +65,33 @@ methods {
     function _.addToWithdrawalQueueHead(address) external => NONDET;
     function _.addToWithdrawalQueueTail(address) external => NONDET;
     function _.totalIdle() external => totalIdleCVL expect uint256;
-    function _.asset() external => assetCVL expect uint256;
+    function _.asset() external => assetCVL expect address;
     function _.totalAssets() external => totalAssetsCVL expect uint256;
     function _.isDestinationRegistered(address dest) external => isDestinationRegisteredCVL[dest] expect bool;
     function _.isDestinationQueuedForRemoval(address dest) external => isDestinationQueuedForRemovalCVL[dest] expect bool;
-    function _.getDestinationInfo(address dest) external => getDestinationInfoCVL(dest) expect LMPDebt.DestinationInfo;
+    function _.getDestinationInfo(address dest) external => getDestinationInfoCVL(calledContract, dest) expect LMPDebt.DestinationInfo;
+
+    // ILMPVault / IDestinationVault
+    function _.isShutdown() external => isShutdownCVL(calledContract) expect bool ALL;
+
+    // IDestinationVault
+    function _.getStats() external => DISPATCHER(true);
+    function _.getValidatedSpotPrice() external => DISPATCHER(true);
+    function _.getPool() external => DISPATCHER(true);
+    function _.underlying() external => DISPATCHER(true);
+    function _.underlyingTokens() external => DISPATCHER(true);
+    function _.debtValue(uint256) external => DISPATCHER(true);
 
     // IRootPriceOracle
     function _.getPriceInEth(address token) external with (env e) 
         => getPriceInEthCVL[token][e.block.timestamp] expect (uint256);
     function _.getSpotPriceInEth(address, address) external => DISPATCHER(true);
 
-    // IDestinationVault
-    function _.getStats() external => DISPATCHER(true);
-    function _.getValidatedSpotPrice() external => DISPATCHER(true);
-    function _.isShutdown() external => DISPATCHER(true);
-    function _.getPool() external => DISPATCHER(true);
-    function _.underlying() external => DISPATCHER(true);
-    function _.underlyingTokens() external => DISPATCHER(true);
-    function _.debtValue(uint256) external => DISPATCHER(true);
-
     // IDexLSTStats
     function _.current() external => NONDET; // can be dispatched if returned values are important
 
     // IBalancerComposableStablePool
-    function _.getBptIndex() external => getBptIndexCVL expect (uint256);
+    function _.getBptIndex() external => ghostGetBptIndexCVL expect (uint256);
 
     // ISystemRegistry
     function _.accessController() external => DISPATCHER(true); // needed in constructor, rest is handled by linking
@@ -108,14 +108,90 @@ methods {
     function _.approve(address,uint256) external => DISPATCHER(true);
     function _.transfer(address,uint256) external => DISPATCHER(true);
     function _.transferFrom(address,address,uint256) external => DISPATCHER(true);
-    // ERC20's `decimals` summarized as 6, 8 or 18 (validDecimal), can be changed to ALWAYS(18) for better runtime.
+    // ERC20's `decimals` summarized as 6, 8 or 18 (ghostValidDecimal), can be changed to ALWAYS(18) for better runtime.
     // This helps with runtime because arbitrary decimal value creates many nonlinear operations.
-    function _.decimals() external => ALWAYS(18); // validDecimal expect uint256; // validDecimal is 6, 8 or 18 for a better summary
+    function _.decimals() external => ALWAYS(18); // ghostValidDecimal expect uint256; // ghostValidDecimal is 6, 8 or 18 for a better summary
 }
 
 ///////////////// DEFINITIONS /////////////////////
 
+definition SECONDS_IN_1_DAY() returns mathint = 60 * 60 * 24;
+
 definition MAX_NAV_TRACKING() returns uint8 = require_uint8(91);
+
+definition DISCOUNT_THRESHOLD_ONE() returns mathint = 3 * 10^5; // 3% 1e7 precision, discount required to consider trimming
+definition DISCOUNT_DAYS_THRESHOLD() returns mathint = 7; // number of last 10 days that it was >= discountThreshold
+definition DISCOUNT_THRESHOLD_TWO() returns mathint = 5 * 10^5; // 5% 1e7 precision, discount required to completely exit
+
+definition ONLY_LMPVAULT_FUNCTIONS(method f) returns bool =
+    f.selector == sig:navUpdate(uint256).selector
+    || f.selector == sig:rebalanceSuccessfullyExecuted(IStrategy.RebalanceParams).selector;
+
+///////////////// GHOSTS & HOOKS //////////////////
+
+//
+// LMPStrategy
+//
+
+ghost uint256 ghostGetBptIndexCVL;
+ghost uint256 ghostValidDecimal {
+    axiom ghostValidDecimal == 6 || ghostValidDecimal == 8 || ghostValidDecimal == 18;
+}
+
+ghost mathint ghostRebalanceValueStats_inPrice;
+ghost mathint ghostRebalanceValueStats_outPrice;
+ghost mathint ghostRebalanceValueStats_inEthValue;
+ghost mathint ghostRebalanceValueStats_outEthValue;
+ghost mathint ghostRebalanceValueStats_swapCost;
+ghost mathint ghostRebalanceValueStats_slippage;
+
+ghost mathint ghostTmpCurrentDebt;
+ghost mathint ghostTmpDestValueAfterRebalance;
+ghost mathint ghostTmpTrimAmount;
+ghost mathint ghostTmpMaxSlippage;
+ghost mathint ghostTmpLmpAssetsAfterRebalance;
+
+//
+// Ghost copy of `LMPStrategy._swapCostOffsetPeriod`
+//
+
+ghost uint16 ghostSwapCostOffsetPeriod;
+
+hook Sload uint16 val _swapCostOffsetPeriod STORAGE {
+    require(ghostSwapCostOffsetPeriod == val);
+}
+
+hook Sstore _swapCostOffsetPeriod uint16 val STORAGE {
+    ghostSwapCostOffsetPeriod = val;
+}
+
+//
+// ILMPVault
+//
+
+ghost uint256 totalIdleCVL;
+ghost address assetCVL;
+ghost uint256 totalAssetsCVL;
+ghost mapping(address => bool) isDestinationRegisteredCVL;
+ghost mapping(address => bool) isDestinationQueuedForRemovalCVL;
+ghost bool ghostIsShutdown_LMPVault;
+
+ghost mapping(address => mathint) ghostLMPVaultDestinationInfo_currentDebt;
+ghost mapping(address => mathint) ghostLMPVaultDestinationInfo_lastReport;
+ghost mapping(address => mathint) ghostLMPVaultDestinationInfo_ownedShares;
+ghost mapping(address => mathint) ghostLMPVaultDestinationInfo_debtBasis;
+
+//
+// IDestinationVault
+//
+
+ghost bool ghostIsShutdown_DestinationVault;
+
+//
+// IRootPriceOracle summaries
+//
+
+ghost mapping(address => mapping(uint256 => uint256)) getPriceInEthCVL;
 
 ////////////////// FUNCTIONS //////////////////////
 
@@ -123,76 +199,43 @@ definition MAX_NAV_TRACKING() returns uint8 = require_uint8(91);
 // LMPStrategy
 //
 
-function getRebalanceValueStatsCVL(IStrategy.RebalanceParams input) returns LMPStrategy.RebalanceValueStats {
-    LMPStrategy.RebalanceValueStats tmp;
-    return tmp;
-}
-
-//  LMPStrategyInt.getDefaultConfig()
-function defaultConfig() {
-    require(swapCostOffsetInitInDays() == require_uint16(28));
-    require(swapCostOffsetTightenThresholdInViolations() == require_uint16(5));
-    require(swapCostOffsetTightenStepInDays() == require_uint16(3));
-    require(swapCostOffsetRelaxThresholdInDays() == require_uint16(20));
-    require(swapCostOffsetRelaxStepInDays() == require_uint16(3));
-    require(swapCostOffsetMaxInDays() == require_uint16(60));
-    require(swapCostOffsetMinInDays() == require_uint16(10));
-    require(navLookback1InDays() == require_uint8(30));
-    require(navLookback2InDays() == require_uint8(60));
-    require(navLookback3InDays() == require_uint8(90));
-    require(maxNormalOperationSlippage() == require_uint256(10 ^ 16)); // 1%
-    require(maxTrimOperationSlippage() == require_uint256(2 * 10 ^ 16)); // 2%
-    require(maxEmergencyOperationSlippage() == require_uint256(25 * 10 ^ 15)); // 2.5%
-    require(maxShutdownOperationSlippage() == require_uint256(15 * 10 ^ 15)); // 1.5%
-    require(weightBase() == require_uint256(10 ^ 6));
-    require(weightFee() == require_uint256(10 ^ 6));
-    require(weightIncentive() == require_uint256(9 * 10 ^ 5));
-    require(weightSlashing() == require_uint256(10 ^ 6));
-    require(weightPriceDiscountExit() == require_int256(75 * 10 ^ 4));
-    require(weightPriceDiscountEnter() == require_int256(0));
-    require(weightPricePremium() == require_int256(10 ^ 6));
-    require(pauseRebalancePeriodInDays() == require_uint16(90));
-    require(maxPremium() == require_int256(10 ^ 16)); // 1%
-    require(maxDiscount() == require_int256(2 * 10 ^ 16)); // 2%
-    require(staleDataToleranceInSeconds() == require_uint40(2 * 60 * 60 * 24)); // 2 days
-    require(maxAllowedDiscount() == require_int256(5 * 10 ^ 16));
-    require(lstPriceGapTolerance() == require_uint256(10 * 60 * 60 * 24)); // 10 days
-}
-
 // LMPStrategyConfig.validate()
-function configValidate() {
+function configValidated() returns bool {
     
-    require(swapCostOffsetInitInDays() >= swapCostOffsetMinInDays());
-    require(swapCostOffsetInitInDays() <= swapCostOffsetMaxInDays());
+    return (swapCostOffsetInitInDays() >= swapCostOffsetMinInDays())
+    && (swapCostOffsetInitInDays() <= swapCostOffsetMaxInDays())
     
-    require(swapCostOffsetMaxInDays() > swapCostOffsetMinInDays());
+    && (swapCostOffsetMaxInDays() > swapCostOffsetMinInDays())
 
-    require(navLookback1InDays() < MAX_NAV_TRACKING());
-    require(navLookback2InDays() < MAX_NAV_TRACKING());
-    require(navLookback3InDays() < MAX_NAV_TRACKING());
+    && (navLookback1InDays() < MAX_NAV_TRACKING())
+    && (navLookback2InDays() < MAX_NAV_TRACKING())
+    && (navLookback3InDays() <= MAX_NAV_TRACKING())
 
-    require(navLookback1InDays() < navLookback2InDays());
-    require(navLookback2InDays() < navLookback3InDays());
+    && (navLookback1InDays() < navLookback2InDays())
+    && (navLookback2InDays() < navLookback3InDays())
 
-    require(maxPremium() >= 0 && maxPremium() <= require_int256(10 ^ 18));
+    && (maxPremium() <= require_int256(10 ^ 18))
 
-    require(maxDiscount() >= 0 && maxDiscount() <= require_int256(10 ^ 18));
+    && (maxDiscount() <= require_int256(10 ^ 18))
 
-    require(maxShutdownOperationSlippage() != 0);
-    require(maxEmergencyOperationSlippage() != 0);
-    require(maxTrimOperationSlippage() != 0);
-    require(maxNormalOperationSlippage() != 0);
-    require(navLookback1InDays() != 0);
+    && (maxShutdownOperationSlippage() != 0)
+    && (maxEmergencyOperationSlippage() != 0)
+    && (maxTrimOperationSlippage() != 0)
+    && (maxNormalOperationSlippage() != 0)
+    && (navLookback1InDays() != 0);
 }
 
+function envSafeAssumptions(env e) {
+    require(e.block.timestamp > 0 && e.block.timestamp < max_uint40);
+}
+
+// State after constructor initialized
 function initConstructor(env e) {
 
+    envSafeAssumptions(e);
+    
     require(lmpVault() != 0);
-
-    // defaultConfig();
-    configValidate();
-
-    require(e.block.timestamp > 0 && e.block.timestamp < max_uint40);
+    require(configValidated());
     require(lastRebalanceTimestamp() >= require_uint40(e.block.timestamp));
 }
 
@@ -200,8 +243,15 @@ function initConstructor(env e) {
 // ILMPVault
 //
 
-function getDestinationInfoCVL(address dest) returns LMPDebt.DestinationInfo {
+function getDestinationInfoCVL(address called, address dest) returns LMPDebt.DestinationInfo {
     LMPDebt.DestinationInfo info;
+    if(called == lmpVault()) {
+        ghostLMPVaultDestinationInfo_currentDebt[dest] = info.currentDebt;
+        ghostLMPVaultDestinationInfo_lastReport[dest] = info.lastReport;
+        ghostLMPVaultDestinationInfo_ownedShares[dest] = info.ownedShares;
+        ghostLMPVaultDestinationInfo_debtBasis[dest] = info.debtBasis;
+    }
+
     return info;
 }
 
@@ -210,45 +260,12 @@ function currentCVL() returns IDexLSTStats.DexLSTStatsData {
     return data;
 }
 
-///////////////// GHOSTS & HOOKS //////////////////
-
-//
-// LMPStrategy
-//
-
-ghost uint256 getBptIndexCVL;
-ghost uint256 validDecimal {
-    axiom validDecimal == 6 || validDecimal == 8 || validDecimal == 18;
-}
-
-//
-// ILMPVault
-//
-
-ghost uint256 totalIdleCVL;
-ghost uint256 assetCVL;
-ghost uint256 totalAssetsCVL;
-ghost mapping(address => bool) isDestinationRegisteredCVL;
-ghost mapping(address => bool) isDestinationQueuedForRemovalCVL;
-
-//
-// IRootPriceOracle summaries
-//
-
-ghost mapping(address => mapping(uint256 => uint256)) getPriceInEthCVL;
-
-//
-// Ghost copy of `_swapCostOffsetPeriod`
-//
-
-ghost uint16 _swapCostOffsetPeriodGhost;
-
-hook Sload uint16 defaultValue _swapCostOffsetPeriod STORAGE {
-    require(_swapCostOffsetPeriodGhost == defaultValue);
-}
-
-hook Sstore _swapCostOffsetPeriod uint16 defaultValue STORAGE {
-    _swapCostOffsetPeriodGhost = defaultValue;
+function isShutdownCVL(address called) returns bool {
+    if(called == lmpVault()) {
+        return ghostIsShutdown_LMPVault;
+    } else {
+        return ghostIsShutdown_DestinationVault;
+    }
 }
 
 ///////////////// PROPERTIES //////////////////////
@@ -257,9 +274,21 @@ use builtin rule sanity;
 
 // Offset period must be between swapCostOffsetMaxInDays and swapCostOffsetMinInDays.
 invariant offsetIsInBetween()
-    _swapCostOffsetPeriodGhost <= swapCostOffsetMaxInDays() && _swapCostOffsetPeriodGhost >= swapCostOffsetMinInDays() {
+    ghostSwapCostOffsetPeriod <= swapCostOffsetMaxInDays() && ghostSwapCostOffsetPeriod >= swapCostOffsetMinInDays() {
     preserved with(env e) {
         initConstructor(e);
+    }
+}
+
+// lastPausedTimestamp() always less or equal block timestamp
+invariant lastPausedTimestampLEqBlockTimestamp(env e) lastPausedTimestamp() <= require_uint40(e.block.timestamp);
+
+// For any registered destination must not be in the future relative to the current block timestamp
+invariant lastAddTimestampByDestination_notInTheFuture(env e, address destination) 
+    lastAddTimestampByDestination(destination) <= require_uint40(e.block.timestamp) {
+    preserved with (env eInv) {
+        require(require_uint40(e.block.timestamp) == require_uint40(eInv.block.timestamp));
+        envSafeAssumptions(e);
     }
 }
 
@@ -280,5 +309,415 @@ rule cantJumpTwoViolationsAtOnce(env e, method f) {
     assert numOfViolationsAfter - numOfViolationsBefore <= 1;
 }
 
+// Only LMPVault can execute specific functions
+rule onlyLMPVault(env e, method f, calldataarg args) 
+    filtered { f -> ONLY_LMPVAULT_FUNCTIONS(f) } {
 
+    f@withrevert(e, args);
+    bool reverted = lastReverted;
 
+    assert(e.msg.sender != lmpVault() => reverted);
+}
+
+// lastPausedTimestamp() variable transition
+rule lastPausedTimestampTransition(env e, method f, calldataarg args) {
+
+    uint40 before = lastPausedTimestamp();
+
+    f(e, args);
+
+    uint40 after = lastPausedTimestamp();
+
+    assert(before != after => after == 0 || after == require_uint40(e.block.timestamp));
+}
+
+// Params should be validated in verifyRebalance() (destinationIn and destinationOut are not equal to LmpVault)
+rule verifyRebalanceParamsValidate_destinationInNeqLmpVault(env e, IStrategy.RebalanceParams params, IStrategy.SummaryStats outSummary) {
+
+    initConstructor(e);
+
+    require(lmpVault() != params.destinationIn);
+    require(params.destinationIn == _BalancerDestVault);
+
+    bool validParams = params.tokenIn == _BalancerDestVault.underlying(e);
+
+    verifyRebalance@withrevert(e, params, outSummary);
+    bool reverted = lastReverted;
+
+    assert(!validParams => reverted);
+}
+
+rule verifyRebalanceParamsValidate_destinationOutNeqLmpVault(env e, IStrategy.RebalanceParams params, IStrategy.SummaryStats outSummary) {
+
+    initConstructor(e);
+
+    require(lmpVault() != params.destinationOut);
+    require(params.destinationOut == _BalancerDestVault);
+
+    bool validParams = params.tokenOut == _BalancerDestVault.underlying(e) 
+        && params.amountOut <= _BalancerDestVault.balanceOf(e, lmpVault());
+
+    verifyRebalance@withrevert(e, params, outSummary);
+    bool reverted = lastReverted;
+
+    assert(!validParams => reverted);
+}
+
+// lastRebalanceTimestamp() variable transition
+rule lastRebalanceTimestampTransition(env e, method f, calldataarg args) {
+
+    uint40 before = lastRebalanceTimestamp();
+
+    f(e, args);
+
+    uint40 after = lastRebalanceTimestamp();
+
+    assert(before != after => after == require_uint40(e.block.timestamp));
+}
+
+// verifyRebalance() reverted when paused
+rule verifyRebalanceNotPaused(env e, IStrategy.RebalanceParams params, IStrategy.SummaryStats outSummary) {
+
+    initConstructor(e);
+    requireInvariant lastPausedTimestampLEqBlockTimestamp(e);
+    require(pauseRebalancePeriodInDays() != 0);
+
+    // Rebalances back to idle are allowed even when a strategy is paused
+    require(params.destinationIn != lmpVault());
+
+    bool paused = lastPausedTimestamp() != 0 
+        ? (to_mathint(require_uint40(e.block.timestamp) - lastPausedTimestamp()) 
+            <= to_mathint(pauseRebalancePeriodInDays() * SECONDS_IN_1_DAY()))
+        : false;
+ 
+    verifyRebalance@withrevert(e, params, outSummary);
+    bool reverted = lastReverted;
+
+    assert(paused => reverted);
+}
+
+// navUpdate() clears pause state
+rule navUpdate_clearPauseState(env e, calldataarg args) {
+
+    require(ghostSwapCostOffsetPeriod != swapCostOffsetMinInDays());
+
+    uint16 swapCostOffsetPeriodBefore = ghostSwapCostOffsetPeriod;
+
+    bool isExpiredPauseState = lastPausedTimestamp() > 0 && !paused(e);
+
+    navUpdate(e, args);
+
+    uint16 swapCostOffsetPeriodAfter = ghostSwapCostOffsetPeriod;
+
+    assert(!isExpiredPauseState 
+        ? swapCostOffsetPeriodBefore == swapCostOffsetPeriodAfter
+        : swapCostOffsetPeriodAfter == swapCostOffsetMinInDays() && lastPausedTimestamp() == 0
+        );
+}
+
+// Constructor
+invariant constructorInitialized(env eInv) lmpVault() != 0 
+        && configValidated() 
+        && ghostSwapCostOffsetPeriod == swapCostOffsetInitInDays()
+        // && lastRebalanceTimestamp() == require_uint40(eInv.block.timestamp)
+    filtered { f -> f.selector == 0 } {
+    preserved with (env eFunc) {
+        require(eFunc.block.timestamp == eInv.block.timestamp); // @todo doesn't work
+        envSafeAssumptions(eFunc);
+        require(false);
+    }
+}
+
+// IStrategy.RebalanceParams
+
+function initRebalanceParamsCVL(env e, IStrategy.RebalanceParams params) {
+
+    // Require validateRebalanceParams() check passed
+    require(validRebalanceParamsCVL(e, params));
+
+    require(params.tokenIn == _ERC20A);
+    require(params.tokenOut == _ERC20B);
+    require(params.destinationIn == lmpVault() || params.destinationIn == _BalancerDestVault);
+    require(params.destinationOut == lmpVault() || params.destinationOut == _BalancerDestVault);
+}
+
+function initRebalanceToIdleParamsCVL(env e, IStrategy.RebalanceParams params) {
+
+    // Require validateRebalanceParams() check passed
+    require(validRebalanceParamsCVL(e, params));
+
+    // params.destinationIn == address(lmpVault)
+    require(params.tokenIn == _ERC20A);
+    require(params.tokenOut == _ERC20B);
+    require(params.destinationIn == lmpVault());
+    require(params.destinationOut == _BalancerDestVault);
+    require(lmpVault() != _ERC20A && lmpVault() != _ERC20B && lmpVault() != _BalancerDestVault);
+}
+
+// ClearExpirePause sets _swapCostOffsetPeriod, so skip when possible to avoid double write
+rule rebalanceSuccessfullyExecuted_updatesSwapCostOffsetPeriod(env e, calldataarg args) {
+
+    initConstructor(e);
+    requireInvariant offsetIsInBetween;
+
+    uint16 period = swapCostOffsetPeriodInDays(e);
+    require(ghostSwapCostOffsetPeriod != period);
+
+    bool isExpiredPauseState = lastPausedTimestamp() > 0 && !paused(e);
+
+    uint16 swapCostOffsetPeriodBefore = ghostSwapCostOffsetPeriod;
+
+    rebalanceSuccessfullyExecuted(e, args);
+
+    uint16 swapCostOffsetPeriodAfter = ghostSwapCostOffsetPeriod;
+
+    assert(!isExpiredPauseState => swapCostOffsetPeriodAfter == period);
+}
+
+// validateRebalanceParams()
+
+function validRebalanceParamsCVL(env e, IStrategy.RebalanceParams params) returns bool {
+    bool notZero = params.destinationIn != 0 && params.tokenIn != 0 && params.amountIn != 0 && params.destinationOut != 0 && params.tokenOut != 0 && params.amountOut != 0;
+    bool dstInRegistered = (params.destinationIn == lmpVault() || isDestinationRegisteredCVL[params.destinationIn] || isDestinationQueuedForRemovalCVL[params.destinationIn]);
+    bool dstOutRegistered = (params.destinationOut == lmpVault() || isDestinationRegisteredCVL[params.destinationOut] || isDestinationQueuedForRemovalCVL[params.destinationOut]);
+    bool correctShutdown = ghostIsShutdown_LMPVault => params.destinationIn == lmpVault();
+    bool destinationNotEq = params.destinationIn != params.destinationOut;
+    bool correctTokenIn = params.destinationIn == lmpVault() => params.tokenIn == assetCVL;
+    bool correctTokenOut = params.destinationOut == lmpVault() 
+        => (params.tokenOut == assetCVL && params.amountOut <= totalIdleCVL);
+    bool validParams = notZero && dstInRegistered && dstOutRegistered && correctShutdown 
+        && destinationNotEq && correctTokenIn && correctTokenOut;
+    return validParams;
+}
+
+rule verifyRebalanceParamsValidated(env e, IStrategy.RebalanceParams params, IStrategy.SummaryStats outSummary) {
+
+    initConstructor(e);
+
+    bool validParams = validRebalanceParamsCVL(e, params);
+
+    verifyRebalance@withrevert(e, params, outSummary);
+    bool reverted = lastReverted;
+
+    assert(!validParams => reverted);
+}
+
+// verifyRebalanceToIdle()
+
+function verifyRebalanceToIdleCVL(env e, bool reverted, IStrategy.RebalanceParams params) {
+    
+    require(ghostTmpMaxSlippage == 0);
+
+    // Scenario 1: the destination has been shutdown -- done when a fast exit is required
+    if(ghostIsShutdown_DestinationVault) {
+        ghostTmpMaxSlippage = to_mathint(maxEmergencyOperationSlippage());
+    }
+
+    // Scenario 2: the LMPVault has been shutdown
+    if (ghostIsShutdown_LMPVault && to_mathint(maxShutdownOperationSlippage()) > ghostTmpMaxSlippage) {
+        ghostTmpMaxSlippage = to_mathint(maxShutdownOperationSlippage());
+    }
+
+    // Scenario 3: position is a dust position and should be trimmed
+    if (verifyCleanUpOperationCLV(e, reverted, params) && to_mathint(maxNormalOperationSlippage()) > ghostTmpMaxSlippage) {
+        ghostTmpMaxSlippage = to_mathint(maxNormalOperationSlippage());
+    }
+
+    // Scenario 4: the destination has been moved out of the LMPs active destinations
+    if (isDestinationQueuedForRemovalCVL[params.destinationOut] && to_mathint(maxNormalOperationSlippage()) > ghostTmpMaxSlippage) {
+        ghostTmpMaxSlippage = to_mathint(maxNormalOperationSlippage());
+    }
+
+    // Scenario 5: the destination needs to be trimmed because it violated a constraint
+    if (to_mathint(maxTrimOperationSlippage()) > ghostTmpMaxSlippage) {
+        ghostTmpTrimAmount = getDestinationTrimAmountHarness(e, params.destinationOut); // @todo getDestinationTrimAmountCVL(params.destinationOut);
+        if (ghostTmpTrimAmount < 10^18 && verifyTrimOperationCVL(e, reverted, params, ghostTmpTrimAmount)) {
+            ghostTmpMaxSlippage = to_mathint(maxTrimOperationSlippage());
+        }
+    }
+
+    assert(ghostTmpMaxSlippage == 0 => reverted);
+    assert(ghostRebalanceValueStats_slippage > ghostTmpMaxSlippage => reverted);
+}
+
+rule verifyRebalance_verifyRebalanceToIdle(env e, IStrategy.RebalanceParams params, IStrategy.SummaryStats outSummary) {
+
+    initConstructor(e);
+    initRebalanceToIdleParamsCVL(e, params);
+
+    bool success;
+    string message; 
+    success, message = verifyRebalance@withrevert(e, params, outSummary);
+    bool reverted = lastReverted;
+
+    // Store slippage into the ghost
+    getRebalanceValueStatsCVL(e, params);
+    verifyRebalanceToIdleCVL(e, reverted, params);
+
+    assert(!reverted => success);
+}
+
+// getRebalanceValueStats()
+
+function getRebalanceValueStatsCVL(env e, IStrategy.RebalanceParams params) returns LMPStrategy.RebalanceValueStats {
+
+    LMPStrategy.RebalanceValueStats tmp;
+    require(tmp.inPrice == require_uint256(ghostRebalanceValueStats_inPrice));
+    require(tmp.outPrice == require_uint256(ghostRebalanceValueStats_outPrice));
+    require(tmp.inEthValue == require_uint256(ghostRebalanceValueStats_inEthValue));
+    require(tmp.outEthValue == require_uint256(ghostRebalanceValueStats_outEthValue));
+    require(tmp.swapCost == require_uint256(ghostRebalanceValueStats_swapCost));
+    require(tmp.slippage == require_uint256(ghostRebalanceValueStats_slippage));
+
+    if(params.destinationOut != lmpVault()) {
+        ghostRebalanceValueStats_outPrice = _BalancerDestVault.getValidatedSpotPrice(e);
+    } else {
+        ghostRebalanceValueStats_outPrice = 10 ^ _ERC20B.decimals(e);
+    }
+
+    if(params.destinationIn != lmpVault()) {
+        ghostRebalanceValueStats_inPrice = _BalancerDestVault.getValidatedSpotPrice(e);
+    } else {
+        ghostRebalanceValueStats_inPrice = 10 ^ _ERC20A.decimals(e);
+    }
+
+    if(params.destinationOut != lmpVault()) {
+        ghostRebalanceValueStats_outEthValue = ghostRebalanceValueStats_outPrice * params.amountOut / 10 ^ _ERC20B.decimals(e);
+    } else {
+        ghostRebalanceValueStats_outEthValue = params.amountOut;
+    }
+
+    if(params.destinationIn != lmpVault()) {
+        ghostRebalanceValueStats_inEthValue = ghostRebalanceValueStats_inPrice * params.amountIn / 10 ^ _ERC20A.decimals(e);
+    } else {
+        ghostRebalanceValueStats_inEthValue = params.amountIn;
+    }
+
+    ghostRebalanceValueStats_swapCost = subSaturateUint256CVL(ghostRebalanceValueStats_outEthValue, ghostRebalanceValueStats_inEthValue);
+    ghostRebalanceValueStats_slippage = ghostRebalanceValueStats_outEthValue == 0
+        ? 0
+        : ghostRebalanceValueStats_swapCost * 10^18 / ghostRebalanceValueStats_outEthValue;
+
+    return tmp;
+}
+
+rule getRebalanceValueStatsIntegrity(env e, IStrategy.RebalanceParams params) {
+
+    initRebalanceParamsCVL(e, params);
+
+    LMPStrategy.RebalanceValueStats stats = getRebalanceValueStatsHarness(e, params);
+    
+    getRebalanceValueStatsCVL(e, params);
+
+    assert(ghostRebalanceValueStats_inPrice == to_mathint(stats.inPrice));
+    assert(ghostRebalanceValueStats_outPrice == to_mathint(stats.outPrice));
+    assert(ghostRebalanceValueStats_inEthValue == to_mathint(stats.inEthValue));
+    assert(ghostRebalanceValueStats_outEthValue == to_mathint(stats.outEthValue));
+    assert(ghostRebalanceValueStats_swapCost == to_mathint(stats.swapCost));
+    assert(ghostRebalanceValueStats_slippage == to_mathint(stats.slippage));
+}
+
+// ensureNotStaleData()
+
+function ensureNotStaleDataCVL(env e, bool reverted, mathint timestamp) {
+    assert(to_mathint(e.block.timestamp) < timestamp => reverted);
+    assert(to_mathint(e.block.timestamp) - timestamp > to_mathint(staleDataToleranceInSeconds()) => reverted);
+}
+
+rule ensureNotStaleDataIntegrity(env e, string name, uint256 dataTimestamp) {
+
+    ensureNotStaleDataHarness@withrevert(e, name, dataTimestamp);
+    bool reverted = lastReverted;
+
+    ensureNotStaleDataCVL(e, reverted, dataTimestamp);
+}
+
+// verifyCleanUpOperation()
+
+function verifyCleanUpOperationCLV(env e, bool reverted, IStrategy.RebalanceParams params) returns bool {
+
+    require(ghostTmpCurrentDebt == 0);
+
+    // ensureNotStaleData
+    ensureNotStaleDataCVL(e, reverted, ghostLMPVaultDestinationInfo_lastReport[params.destinationOut]);
+
+    // adjust the current debt based on the currently owned shares
+    if(ghostLMPVaultDestinationInfo_ownedShares[params.destinationOut] != 0) {
+        ghostTmpCurrentDebt = (ghostLMPVaultDestinationInfo_currentDebt[params.destinationOut] 
+            * to_mathint(_BalancerDestVault.balanceOf(e, lmpVault()))) 
+                / ghostLMPVaultDestinationInfo_ownedShares[params.destinationOut];
+    }
+
+    // If the current position is < 2% of total assets, trim to idle is allowed
+    if(ghostTmpCurrentDebt * 10^18 < (totalAssetsCVL * 10^18) / 50) {
+        return true;
+    }
+
+    return false;
+}
+
+rule verifyCleanUpOperationIntegrity(env e, IStrategy.RebalanceParams params) {
+
+    initRebalanceToIdleParamsCVL(e, params);
+
+    bool result = verifyCleanUpOperationHarness@withrevert(e, params);
+    bool reverted = lastReverted;
+
+    bool resultCVL = verifyCleanUpOperationCLV(e, reverted, params);
+
+    assert(!reverted => result == resultCVL);
+}
+
+// verifyTrimOperation() 
+
+function verifyTrimOperationCVL(env e, bool reverted, IStrategy.RebalanceParams params, mathint trimAmount) returns bool {
+
+    if(trimAmount == 0) {
+        return true;
+    }
+
+    // revert if information is too old
+    ensureNotStaleDataCVL(e, reverted, ghostLMPVaultDestinationInfo_lastReport[params.destinationOut]);
+
+    // adjust the current debt based on the currently owned shares
+    if(ghostLMPVaultDestinationInfo_ownedShares[params.destinationOut] == 0) {
+        ghostTmpCurrentDebt = 0;
+    } else {
+        ghostTmpCurrentDebt = 
+            (ghostLMPVaultDestinationInfo_currentDebt[params.destinationOut] 
+                * to_mathint(_BalancerDestVault.balanceOf(e, lmpVault()))) 
+            / ghostLMPVaultDestinationInfo_ownedShares[params.destinationOut];
+    }
+
+    // calculate the total value of the lmpVault after the rebalance is made
+    ghostTmpDestValueAfterRebalance = to_mathint(_BalancerDestVault.debtValue(e, require_uint256(_BalancerDestVault.balanceOf(e, lmpVault()) - params.amountOut)));
+    ghostTmpLmpAssetsAfterRebalance = 
+        to_mathint(totalAssetsCVL) 
+        + to_mathint(params.amountIn) 
+        + ghostTmpDestValueAfterRebalance
+        - ghostTmpCurrentDebt;
+
+    if(ghostTmpLmpAssetsAfterRebalance > 0) {
+        return (ghostTmpDestValueAfterRebalance * 10^18) / ghostTmpLmpAssetsAfterRebalance >= trimAmount;
+    } else {
+        return true;
+    }
+}
+
+rule verifyTrimOperationIntegrity(env e, IStrategy.RebalanceParams params, uint256 trimAmount) {
+    
+    initRebalanceToIdleParamsCVL(e, params);
+
+    bool result = verifyTrimOperationHarness@withrevert(e, params, trimAmount);
+    bool reverted = lastReverted;
+
+    bool resultCVL = verifyTrimOperationCVL(e, reverted, params, trimAmount);
+
+    assert(!reverted => result == resultCVL);
+}
+
+// subSaturate()
+function subSaturateUint256CVL(mathint a, mathint b) returns mathint {
+    if (b >= a) return 0;
+    return a - b;
+}

@@ -17,4 +17,28 @@ contract LMPStrategyHarness is LMPStrategy{
     function getSwapCostOffsetTightenThresholdInViolations() external returns (uint16){
         return swapCostOffsetTightenThresholdInViolations;
     }
+
+    function getRebalanceValueStatsVars(LMPStrategy.RebalanceValueStats memory stats) external returns (uint256, uint256, uint256, uint256, uint256, uint256) {
+        return (stats.inPrice, stats.outPrice, stats.inEthValue, stats.outEthValue, stats.swapCost, stats.slippage);
+    }
+
+    function getRebalanceValueStatsHarness(IStrategy.RebalanceParams memory params) external returns (LMPStrategy.RebalanceValueStats memory stats) {
+        return getRebalanceValueStats(params);
+    }
+
+    function verifyTrimOperationHarness(IStrategy.RebalanceParams memory params, uint256 trimAmount) external returns (bool) {
+        return verifyTrimOperation(params, trimAmount);
+    }
+
+    function ensureNotStaleDataHarness(string memory name, uint256 dataTimestamp) external view {
+        ensureNotStaleData(name, dataTimestamp);
+    }
+
+    function verifyCleanUpOperationHarness(IStrategy.RebalanceParams memory params) external view returns (bool) {
+        return verifyCleanUpOperation(params);
+    }
+
+    function getDestinationTrimAmountHarness(IDestinationVault dest) external returns (uint256) {
+        return getDestinationTrimAmount(dest);
+    }
 } 
