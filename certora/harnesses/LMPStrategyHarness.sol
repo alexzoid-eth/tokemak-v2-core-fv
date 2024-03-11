@@ -22,8 +22,9 @@ contract LMPStrategyHarness is LMPStrategy{
         return (stats.inPrice, stats.outPrice, stats.inEthValue, stats.outEthValue, stats.swapCost, stats.slippage);
     }
 
-    function getRebalanceValueStatsHarness(IStrategy.RebalanceParams memory params) external returns (LMPStrategy.RebalanceValueStats memory stats) {
-        return getRebalanceValueStats(params);
+    function getRebalanceValueStatsHarness(IStrategy.RebalanceParams memory params) external returns (uint256, uint256, uint256, uint256, uint256, uint256) {
+        LMPStrategy.RebalanceValueStats memory stats = getRebalanceValueStats(params);
+        return (stats.inPrice, stats.outPrice, stats.inEthValue, stats.outEthValue, stats.swapCost, stats.slippage);
     }
 
     function verifyTrimOperationHarness(IStrategy.RebalanceParams memory params, uint256 trimAmount) external returns (bool) {
