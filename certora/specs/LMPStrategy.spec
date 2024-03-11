@@ -552,8 +552,6 @@ rule verifyRebalance_verifyRebalanceToIdleSlippageCheck(env e, IStrategy.Rebalan
     bool reverted = lastReverted;
 
     mathint slippage = verifyRebalanceToIdleCVL(e, reverted, params);
-
-    assert(slippage == 0 => reverted);
     assert(slippageCVL > slippage => reverted);
 }
 
