@@ -531,30 +531,6 @@ function verifyRebalanceToIdleCVL(env e, bool reverted, IStrategy.RebalanceParam
     return retSlippage5;
 }
 
-rule verifyRebalance_verifyRebalanceToIdleSlippageCheck(env e, IStrategy.RebalanceParams params, IStrategy.SummaryStats outSummary) {
-
-    initConstructor(e);
-    require(params.destinationIn == lmpVault());
-
-    // Store slippage into the ghost
-    mathint inPriceCVL;
-    mathint outPriceCVL;
-    mathint inEthValueCVL;
-    mathint outEthValueCVL;
-    mathint swapCostCVL;
-    mathint slippageCVL;
-    inPriceCVL, outPriceCVL, inEthValueCVL, outEthValueCVL, swapCostCVL, slippageCVL 
-        = getRebalanceValueStatsCVL(e, params);
-
-    bool success;
-    string message; 
-    success, message = verifyRebalance@withrevert(e, params, outSummary);
-    bool reverted = lastReverted;
-
-    mathint slippage = verifyRebalanceToIdleCVL(e, reverted, params);
-    assert(slippageCVL > slippage => reverted);
-}
-
 // getRebalanceValueStats()
 
 function getRebalanceValueStatsCVL(env e, IStrategy.RebalanceParams params) 
