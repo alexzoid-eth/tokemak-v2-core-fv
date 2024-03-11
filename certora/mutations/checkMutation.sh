@@ -27,8 +27,8 @@ if [ "$#" -lt 1 ]; then
 fi
 
 MUTATION_DIRECTORY_NAME="$1"
-# If name contains several parts divided by `_`, use first part as a config name
-CONFIG_NAME=$(echo "$MUTATION_DIRECTORY_NAME" | cut -d '_' -f 1)
+# If name contains several parts divided by `-`, use first part as a config name
+CONFIG_NAME=$(echo "$MUTATION_DIRECTORY_NAME" | cut -d '-' -f 1)
 shift
 
 # Check if next argument not a mutation number or option
